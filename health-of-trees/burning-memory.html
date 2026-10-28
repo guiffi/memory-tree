@@ -31,7 +31,10 @@
   .log { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 1px; font-size: 11px; font-weight: 500; line-height: 1.25; }
   .log li { overflow-wrap: anywhere; }
 
-  .test { margin-top: auto; display: flex; gap: 18px; flex-wrap: wrap; }
+  .test { margin-top: auto; display: flex; flex-direction: column; gap: 10px; }
+  .test-row { display: flex; gap: 18px; flex-wrap: wrap; }
+  .readout { margin: 0; font-size: 10.5px; line-height: 1.4; color: var(--ink-soft); font-variant-numeric: tabular-nums; }
+  .readout b { color: var(--ink); font-weight: 500; }
   .small-btn {
     font: inherit; font-size: 13px; font-weight: 500; color: var(--ink); background: none; border: 0; padding: 4px 0; cursor: pointer;
   }
@@ -55,8 +58,13 @@
     </section>
 
     <section class="test" aria-label="Test controls">
-      <button class="small-btn" id="fireBtn">Start a fire</button>
-      <button class="small-btn" id="waterBtn"><span aria-hidden="true">↓</span>water</button>
+      <p class="readout" id="rateOut" aria-live="off"></p>
+      <p class="readout" id="chanceOut" aria-live="off"></p>
+      <div class="test-row">
+        <button class="small-btn" id="fireBtn">Start a fire</button>
+        <button class="small-btn" id="waterBtn"><span aria-hidden="true">↓</span>water</button>
+        <button class="small-btn" id="chanceBtn">+25% likelihood</button>
+      </div>
     </section>
   </aside>
   <div class="stage" id="stage">
@@ -127,7 +135,7 @@
 
   let W = 0, H = 0, dpr = 1, cx = 0, cy = 0, maxR = 0, fontPx = 10, bigPx = 19;
   let rings = [], ignitions = [], particles = [];
-  let rateMul = 1, waterTimer = 0, regrow = -1, t = 0;
+  let regrow = -1, t = 0;
 
   // ---- glyph widths ------------------------------------------------------
   const widthCache = new Map();
@@ -152,24 +160,29 @@
   const SEED_RINGS = 6;
   let visitors = ['local'];  // visitor ids in join order; replaced by the shared list when online
   let myId = 'local';
+  // STEP 3 · the memory: lines of memory.txt from the server ({ id, text }), one ring each; null without a server
+  let memory = null;
+  const memoryLines = () => memory.filter(l => l.text.trim());
 
   function makeRing(i, born) {
     const rand = rng(1000 + i * 7);
-    const rec = RECORDS[i % RECORDS.length].split(' ');
-    return { i, R: 0, rec, k: Math.floor(rand() * rec.length), len: 0, words: [], glyphs: [], dirty: true,
+    const line = memory ? memoryLines()[i] : null;
+    const rec = (line ? line.text : RECORDS[i % RECORDS.length]).split(' ').filter(Boolean);
+    return { i, R: 0, rec, owner: line ? line.id : null, k: Math.floor(rand() * rec.length), len: 0, words: [], glyphs: [], dirty: true,
       rot: rand() * TAU, speed: (0.03 - i * 0.0007) * (reduced ? 0 : 1), born, mine: false };
   }
   // enough repeats to wrap the ring, plus spare words that slide in as burning words grow
   function fillWords(r) {
+    if (!r.rec.length) return;
     while (r.len < TAU * r.R * 1.6) {
       const text = r.rec[r.k++ % r.rec.length];
-      r.words.push({ text, stage: 0, timer: 0, lx: 0, ly: 0, visible: false });
+      r.words.push({ text, stage: 0, lost: 0, lx: 0, ly: 0, visible: false });
       r.len += (text.length + 1) * fontPx * 0.55;
     }
   }
   function syncRings(born = t) {
     if (!W) return;
-    const want = SEED_RINGS + visitors.length;
+    const want = memory ? memoryLines().length : SEED_RINGS + visitors.length;
     const r0 = fontPx * 3.2;
     const gap = Math.max(fontPx * 1.7, Math.min(fontPx * 2.35, (maxR - r0) / Math.max(1, want - 1)));
     const n = Math.min(want, Math.floor((maxR - r0) / gap) + 1); // a full stage stops growing outward
@@ -177,7 +190,7 @@
     rings.length = n;
     for (const r of rings) {
       r.R = r0 + r.i * gap;
-      r.mine = visitors[r.i - SEED_RINGS] === myId;
+      r.mine = memory ? r.owner === myId : visitors[r.i - SEED_RINGS] === myId;
       fillWords(r);
       r.dirty = true;
     }
@@ -243,20 +256,84 @@
 
   // ---- fire ----------------------------------------------------------------
   function ignite(x, y, r0 = 0) { ignitions.push({ x, y, r: r0 }); }
-  function randomEdgePoint() { const a = Math.random() * TAU; const r = maxR * (0.5 + Math.random() * 0.45); return [cx + Math.cos(a) * r, cy + Math.sin(a) * r]; }
+  function randomEdgePoint() {
+    // somewhere in the outer half of the tree, however big it has grown
+    const outer = rings.length ? rings[rings.length - 1].R + fontPx : maxR;
+    const a = Math.random() * TAU, r = outer * (0.5 + Math.random() * 0.45);
+    return [cx + Math.cos(a) * r, cy + Math.sin(a) * r];
+  }
 
   function health() {
     let all = 0, alive = 0;
     for (const r of rings) for (const w of r.words) if (w.visible) { all++; if (w.stage === 0) alive++; }
     return all ? alive / all : 1;
   }
-  function burnRate() { return rateMul * (1 - Math.min(0.95, blow * 1.6)); }
+  // ---- STEP 1 · rate of burning, in characters lost per second -----------------
+  //   rate = BASE × time × near × device × water
+  //   time   1 → 3    grows by 0.1 for every minute on the page (capped at 20 minutes)
+  //   near   1 or 1.5 1.5 when a satellite saw a fire within NEAR_KM of the visitor in the last 7 days (GWIS)
+  //   device 1 → 2    how hard the device is working, measured from the time between animation frames
+  //   water  0.2 → 1  water drops it to 0.2, and it comes back to 1 over WATER_S seconds
+  const BASE = 2, NEAR_KM = 50, WATER_S = 30;
+  const opened = performance.now();
+  let lastWater = -Infinity;   // seconds (t) when water was last added, by anyone
+  let nearestKm = null;        // distance to the closest fire seen in the last 7 days, null when unknown
+  let frameMs = 16.7;          // smoothed time between frames
+  let charsLost = 0;
+
+  function burnFactors() {
+    const minutes = (performance.now() - opened) / 60000;
+    const time = 1 + Math.min(minutes, 20) / 10;
+    const near = nearestKm !== null && nearestKm <= NEAR_KM ? 1.5 : 1;
+    const device = 1 + Math.min(1, Math.max(0, (frameMs - 20) / 30)); // 50 fps or better = 1, 20 fps or worse = 2
+    const water = 0.2 + 0.8 * Math.min(1, (t - lastWater) / WATER_S);
+    return { time, near, device, water, rate: BASE * time * near * device * water };
+  }
+
+  // ---- STEP 2 · likelihood of a fire starting, in percent ---------------------
+  // Only grows while nothing is burning. At 100% a fire starts and it goes back to 0.
+  //   per minute = P_BASE × near × danger × device × tab
+  //   near    1 → 3    3 with a fire right next to the visitor, falling to 1 at 150 km or more (GWIS hotspots, 7 days)
+  //   danger  0.5 → 6  today's EFFIS Fire Danger class at the visitor's location (from the Fire Weather Index)
+  //   device  1 → 2    same measure as the rate of burning
+  //   tab     1 → 3    grows with the time the page has been open (capped at 30 minutes), ×2 while the tab is in the background
+  const P_BASE = 2;
+  const DANGER = [ // EFFIS classes: name, lowest FWI, weight
+    ['Very low', -Infinity, 0.5], ['Low', 5.2, 1], ['Moderate', 11.2, 1.5],
+    ['High', 21.3, 2.5], ['Very high', 38, 4], ['Extreme', 50, 6],
+  ];
+  let fwi = null;       // today's Fire Weather Index at the visitor's location, null when unknown
+  let likelihood = 0;   // percent
+  const dangerOf = v => DANGER.reduce((cls, c) => v >= c[1] ? c : cls, DANGER[0]);
+
+  function fireFactors() {
+    const near = nearestKm === null ? 1 : 1 + 2 * Math.max(0, 1 - nearestKm / 150);
+    const danger = fwi === null ? 1 : dangerOf(fwi)[2];
+    const device = 1 + Math.min(1, Math.max(0, (frameMs - 20) / 30));
+    const minutes = (performance.now() - opened) / 60000;
+    const tab = (1 + Math.min(minutes, 30) / 15) * (document.hidden ? 2 : 1);
+    return { near, danger, device, tab, perMin: P_BASE * near * danger * device * tab };
+  }
+
+  // a timer rather than the animation, so it keeps counting when the visitor clicks away from the tab
+  let lastTick = Date.now();
+  setInterval(() => {
+    const now = Date.now(), minutes = (now - lastTick) / 60000; lastTick = now;
+    if (!ignitions.length && regrow < 0 && health() >= 0.03) {
+      likelihood = Math.min(100, likelihood + fireFactors().perMin * minutes);
+      if (likelihood >= 100) { addLog('The likelihood of fire reached 100%'); startFire(); }
+    }
+    readouts();
+  }, 1000);
+
+  // characters a word loses at each step: five steps, then nothing is left
+  const stepCost = w => Math.min(w.text.length - w.lost, Math.ceil(w.text.length / (FIRE_STEPS + 1)));
 
   // saving puts burning words back to their original text
   function saveBurning(chance) {
     let saved = null;
     for (const r of rings) for (const w of r.words) {
-      if (w.stage > 0 && w.stage <= FIRE_STEPS && Math.random() < chance) { w.stage = 0; w.timer = 0; r.dirty = true; saved = saved || w.text; }
+      if (w.stage > 0 && w.stage <= FIRE_STEPS && Math.random() < chance) { w.stage = 0; w.lost = 0; r.dirty = true; saved = saved || w.text; }
     }
     return saved;
   }
@@ -264,12 +341,16 @@
   function water(user, remote) {
     const who = user || me;
     if (!remote) post('water');
+    if (health() < 0.03 && memory) {
+      addLog(`${who} added water, but the memory is gone · only new visitors grow new rings`);
+      return;
+    }
     if (health() < 0.03) {
       regrow = 0; ignitions = [];
       addLog(`${who} just added water · the forest grows back`);
       return;
     }
-    rateMul = 0.08; waterTimer = 6;
+    lastWater = t;
     ignitions.forEach(ig => ig.r *= 0.8);
     const saved = saveBurning(0.75);
     addLog(`${who} just added water`);
@@ -278,24 +359,25 @@
 
   function startFire(user, remote) {
     if (health() < 0.03 || regrow >= 0) return;
-    const [x, y] = randomEdgePoint(); ignite(x, y, maxR * 0.15);
+    const [x, y] = randomEdgePoint(); ignite(x, y, Math.max(maxR * 0.06, (rings.length ? rings[rings.length - 1].R : maxR) * 0.15));
+    likelihood = 0;
     addLog(`${user || me} started a fire`);
     if (!remote) post('fire');
   }
 
   function smoke(x, y) { return { x, y, vx: (Math.random() - 0.5) * 8, vy: -10 - Math.random() * 14, life: 1, decay: 0.25 + Math.random() * 0.2 }; }
 
-  let blow = 0, blowing = false;
-
   // ---- loop --------------------------------------------------------------
   let last = performance.now();
   function frame(now) {
-    const dt = Math.min(0.05, (now - last) / 1000); last = now; t += dt;
-    if (waterTimer > 0) { waterTimer -= dt; if (waterTimer <= 0) rateMul = 1; }
-    else rateMul += (1 - rateMul) * dt;
+    const gapMs = now - last;
+    const dt = Math.min(0.05, gapMs / 1000); last = now; t += dt;
+    if (!document.hidden && gapMs < 1000) frameMs += (gapMs - frameMs) * 0.05;
 
-    const rate = burnRate();
-    if (!blowing) for (const ig of ignitions) ig.r += dt * 30 * rate;
+    const f = burnFactors();
+    for (const ig of ignitions) ig.r += dt * 8 * f.rate;
+    if (ignitions.length) burnBudget += f.rate * Math.min(1, gapMs / 1000); // real time, so slow frames don't burn less
+    const burning = [], inFront = [];
 
     // regrowth: rings return from the pith outward
     if (regrow >= 0) {
@@ -315,27 +397,12 @@
       r.rot += r.speed * dt;
       const cs = Math.cos(r.rot), sn = Math.sin(r.rot);
 
-      // catch and advance fire, word by word
-      for (const w of r.words) {
+      // words that are burning, and words the fire front has reached
+      if (ignitions.length) for (const w of r.words) {
         if (!w.visible) continue;
-        if (w.stage === 0 && ignitions.length) {
-          const x = cx + w.lx * cs - w.ly * sn, y = cy + w.lx * sn + w.ly * cs;
-          for (const ig of ignitions) {
-            const dx = x - ig.x, dy = y - ig.y;
-            if (dx * dx + dy * dy < ig.r * ig.r && Math.random() < 0.05 * rate) {
-              w.stage = 1; w.timer = 0; r.dirty = true;
-              if (t - lastBurnLog > 2.5) { lastBurnLog = t; addLog(`The word «${clean(w.text)}» is burning`); }
-              break;
-            }
-          }
-        } else if (w.stage > 0 && w.stage <= FIRE_STEPS) {
-          w.timer += dt * Math.max(0.05, rate);
-          if (w.timer > 0.55) {
-            w.timer = 0; w.stage++; r.dirty = true;
-            const x = cx + w.lx * cs - w.ly * sn, y = cy + w.lx * sn + w.ly * cs;
-            for (let k = 0; k < 3; k++) particles.push(smoke(x + (Math.random() - 0.5) * 10, y));
-          }
-        }
+        const x = cx + w.lx * cs - w.ly * sn, y = cy + w.lx * sn + w.ly * cs;
+        if (w.stage > 0 && w.stage <= FIRE_STEPS) burning.push({ w, r, x, y });
+        else if (w.stage === 0 && ignitions.some(ig => (x - ig.x) ** 2 + (y - ig.y) ** 2 < ig.r * ig.r)) inFront.push({ w, r, x, y });
       }
       if (r.dirty) layout(r);
 
@@ -353,11 +420,13 @@
       }
     }
 
+    spendBudget(burning, inFront);
+
     ctx.globalAlpha = 1;
     // smoke: plain black dots that rise and drift with the breath
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.font = `400 ${fontPx}px ${FONT}`;
-    const wind = blow * 70;
+    const wind = 0;
     for (let i = particles.length - 1; i >= 0; i--) {
       const p = particles[i];
       p.x += (p.vx + wind) * dt; p.y += p.vy * dt; p.life -= p.decay * dt;
@@ -369,6 +438,47 @@
     if (ignitions.length && ignitions.every(ig => ig.r > maxR * 2.6)) ignitions = [];
     updateHud();
     requestAnimationFrame(frame);
+  }
+
+  // the fire eats exactly `rate` characters per second: each character either moves a burning
+  // word one step closer to "fire", or sets a new word in the fire front alight
+  let burnBudget = 0;
+  function spendBudget(burning, inFront) {
+    while (burnBudget >= 1) {
+      const spread = inFront.length && (!burning.length || Math.random() < 0.35);
+      const pick = spread ? inFront.splice(Math.floor(Math.random() * inFront.length), 1)[0]
+                          : burning.length ? burning[Math.floor(Math.random() * burning.length)] : null;
+      // nothing in reach: the front widens so the fire keeps its rate
+      if (!pick) { ignitions.forEach(ig => ig.r += 6); burnBudget = Math.min(burnBudget, 20); return; }
+      const { w, r, x, y } = pick;
+      const cost = stepCost(w);
+      w.lost += cost; w.stage++; r.dirty = true;
+      burnBudget -= cost; charsLost += cost;
+      if (w.stage === 1) {
+        burning.push(pick);
+        if (t - lastBurnLog > 2.5) { lastBurnLog = t; addLog(`The word «${clean(w.text)}» is burning`); }
+      } else if (w.stage > FIRE_STEPS) {
+        burning.splice(burning.indexOf(pick), 1);
+        if (r.owner && net && net.burn) net.burn(r.owner, w.text); // deleted from memory.txt
+      }
+      for (let k = 0; k < 2; k++) particles.push(smoke(x + (Math.random() - 0.5) * 10, y));
+    }
+  }
+
+  // test readouts for steps 1 and 2
+  function readouts() {
+    const f = burnFactors();
+    const near = nearestKm === null ? 'location not shared' : `nearest fire ${Math.round(nearestKm)} km`;
+    $('rateOut').innerHTML =
+      `<b>${ignitions.length ? 'Burning' : 'No fire · would burn'} ${f.rate.toFixed(1)} characters/second</b><br>` +
+      `${BASE} × time ${f.time.toFixed(2)} × near ${f.near} × device ${f.device.toFixed(2)} × water ${f.water.toFixed(2)}<br>` +
+      `${near} · ${Math.round(1000 / frameMs)} fps · ${charsLost} characters lost`;
+    const p = fireFactors();
+    const danger = fwi === null ? 'unknown' : `${dangerOf(fwi)[0]}, FWI ${fwi.toFixed(1)}`;
+    $('chanceOut').innerHTML =
+      `<b>Fire likelihood ${Math.floor(likelihood)}%${ignitions.length ? ' · paused while burning' : ` · +${p.perMin.toFixed(1)}% a minute`}</b><br>` +
+      `${P_BASE} × near ${p.near.toFixed(2)} × danger ${p.danger} × device ${p.device.toFixed(2)} × tab ${p.tab.toFixed(2)}<br>` +
+      `fire danger today: ${danger}`;
   }
 
   let hudTick = 0, wasBurned = false;
@@ -461,25 +571,86 @@
     myId = id; me = handle(id); showId();
 
     const sock = io(base);
-    net = { send: type => sock.emit('action', type) };
-    const ids = list => Array.isArray(list) ? list.filter(v => typeof v === 'string') : visitors;
+    net = { send: type => sock.emit('action', type), burn: (owner, word) => sock.emit('burn', { owner, word }) };
+    const isLine = l => l && typeof l.id === 'string' && typeof l.text === 'string';
     let first = true;
     sock.on('connect', () => sock.emit('hello', id));
     sock.on('init', d => {
-      visitors = ids(d.visitors); syncRings(first ? -10 : t);
-      if (!first) return;
+      if (!first) return; // a reconnect: this screen already shows the memory
       first = false;
+      memory = (Array.isArray(d.memory) ? d.memory : []).filter(isLine);
+      visitors = memory.map(l => l.id);
+      rings = []; syncRings(-10);
       for (const ev of Array.isArray(d.events) ? d.events : []) if (ev && TYPES.includes(ev.type)) addLog(describe(ev));
-      addLog(d.isNew ? `${me} joined · a new ring grows` : `${me} came back`);
+      if (d.hasLine) addLog(`${me} came back`);
+      else placeReady.then(place => sock.emit('place', place));
+      if (memory.length && !memoryLines().length) addLog('All memory has been lost · new visitors grow new rings');
     });
-    sock.on('visitors', list => { visitors = ids(list); syncRings(); });
-    sock.on('joined', vid => { if (typeof vid === 'string') addLog(`${handle(vid)} joined · a new ring grows`); });
+    // a new visitor's line was written to memory.txt
+    sock.on('line', l => {
+      if (!memory || !isLine(l) || memory.some(m => m.id === l.id)) return;
+      memory.push(l); visitors.push(l.id); syncRings();
+      addLog(`${l.id === myId ? me : handle(l.id)} joined · a new ring grows`);
+    });
     sock.on('action', ev => { if (ev && TYPES.includes(ev.type)) applyRemote(ev); });
+  }
+
+  // ---- proximity to wildfires: satellite hotspots from GWIS (EFFIS / Copernicus) -----
+  const GWIS = 'https://maps.effis.emergency.copernicus.eu/gwis';
+  function kmBetween(a, b, c, d) {
+    const R = 6371, rad = Math.PI / 180;
+    const x = Math.sin((c - a) * rad / 2) ** 2 + Math.cos(a * rad) * Math.cos(c * rad) * Math.sin((d - b) * rad / 2) ** 2;
+    return 2 * R * Math.asin(Math.sqrt(x));
+  }
+  async function findNearestFire(lat, lon) {
+    // a box about 300 km wide; with EPSG:4326 the WFS 1.1.0 box is lat,lon order
+    const dLat = 1.5, dLon = 1.5 / Math.max(0.2, Math.cos(lat * Math.PI / 180));
+    const url = `${GWIS}?service=WFS&version=1.1.0&request=GetFeature&typename=ms:all.hs.week.points&srsName=EPSG:4326&outputFormat=geojson` +
+      `&BBOX=${lat - dLat},${lon - dLon},${lat + dLat},${lon + dLon},EPSG:4326`;
+    const data = await (await fetch(url)).json();
+    let best = Infinity;
+    for (const ft of data.features || []) {
+      const [fx, fy] = ft.geometry.coordinates;
+      best = Math.min(best, kmBetween(lat, lon, fy, fx));
+    }
+    return best; // Infinity: no fire within about 150 km
+  }
+  // today's Fire Weather Index from the ECMWF fire danger layer
+  async function findFireDanger(lat, lon) {
+    const day = new Date().toISOString().slice(0, 10);
+    const url = `${GWIS}?service=WMS&version=1.3.0&request=GetFeatureInfo&layers=ecmwf.query&query_layers=ecmwf.query&styles=` +
+      `&crs=EPSG:4326&width=3&height=3&i=1&j=1&info_format=text/html&time=${day}` +
+      `&bbox=${lat - 0.1},${lon - 0.1},${lat + 0.1},${lon + 0.1}`;
+    const m = (await (await fetch(url)).text()).match(/\(FWI\)<\/td><td>([-\d.]+)/);
+    return m ? +m[1] : null; // null over the sea or when the day isn't published yet
+  }
+
+  // where the visitor is, for their line of memory: rounded coordinates and the city of their time zone, or null
+  let placeFound;
+  const placeReady = new Promise(res => { placeFound = res; setTimeout(() => res(null), 20000); });
+  const tzCity = () => { try { return (Intl.DateTimeFormat().resolvedOptions().timeZone || '').split('/').pop().replace(/_/g, ' '); } catch { return ''; } };
+
+  function locate() {
+    if (!navigator.geolocation) return placeFound({ city: tzCity() });
+    navigator.geolocation.getCurrentPosition(async pos => {
+      // rounded to about 1 km before it leaves the browser
+      const lat = +pos.coords.latitude.toFixed(2), lon = +pos.coords.longitude.toFixed(2);
+      placeFound({ lat, lon, city: tzCity() });
+      try {
+        nearestKm = await findNearestFire(lat, lon);
+        addLog(nearestKm <= NEAR_KM ? `${me} lives ${Math.round(nearestKm)} km from a wildfire · burning is faster` : `${me} lives far from this week's wildfires`);
+      } catch { /* GWIS unreachable: proximity stays unknown */ }
+      try {
+        fwi = await findFireDanger(lat, lon);
+        if (fwi !== null) addLog(`Fire danger for ${me} today: ${dangerOf(fwi)[0]}`);
+      } catch { /* danger stays unknown */ }
+    }, () => placeFound({ city: tzCity() }), { maximumAge: 3600000, timeout: 15000 });
   }
 
   // ---- wiring ------------------------------------------------------------
   $('waterBtn').addEventListener('click', () => water());
   $('fireBtn').addEventListener('click', () => startFire());
+  $('chanceBtn').addEventListener('click', () => { if (!ignitions.length) likelihood = Math.min(99.9, likelihood + 25); });
 
   let resizeT;
   new ResizeObserver(() => { clearTimeout(resizeT); resizeT = setTimeout(build, 120); }).observe(stage);
@@ -488,6 +659,7 @@
     build();
     showId();
     connectShared().catch(() => {});
+    locate();
     requestAnimationFrame(t0 => { last = t0; requestAnimationFrame(frame); });
   };
   (document.fonts ? Promise.all([document.fonts.load('400 10px "Lexend"'), document.fonts.load('500 10px "Lexend"')]).catch(() => {}) : Promise.resolve()).then(go, go);

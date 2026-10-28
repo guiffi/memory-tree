@@ -1,0 +1,9 @@
+# Render deploy: New → Blueprint → pick this repo. Runs the live server in health-of-trees/.
+services:
+  - type: web
+    name: health-of-trees
+    runtime: node
+    rootDir: health-of-trees
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
