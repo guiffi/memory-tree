@@ -1,0 +1,495 @@
+<meta charset="utf-8">
+<title>Health of Trees</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Lexend:wght@300;400;500&display=swap">
+<style>
+  /* Layout: one-screen app. Tree of text rings fills the left; a narrow column on the right holds title, activity and notifications. */
+  :root {
+    --paper: #fbfbfa;        /* white paper, single committed colour */
+    --ink: #0b0b0b;
+    --ink-soft: #6a6a66;
+    --font: "Lexend", "Avenir Next", "Helvetica Neue", sans-serif;
+    color-scheme: light;
+  }
+  html, body { height: 100%; }
+  body { background-color: var(--paper); color: var(--ink); font-family: var(--font); font-size: 12px; }
+  .app { height: 100%; display: grid; grid-template-columns: 300px minmax(0, 1fr); }
+  .stage { position: relative; min-width: 0; min-height: 0; }
+  #tree { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
+
+  .panel {
+    padding-block: 32px 24px;
+    padding-left: max(28px, env(safe-area-inset-left, 0px));
+    padding-right: 12px;
+    display: flex; flex-direction: column; gap: 28px;
+    overflow-y: auto; min-width: 0;
+  }
+  h3 { font-weight: 500; font-size: 22px; margin: 0 0 12px; }
+  .me { font-size: 11px; font-weight: 500; margin: 0 0 14px; font-variant-numeric: tabular-nums; }
+  .log { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 1px; font-size: 11px; font-weight: 500; line-height: 1.25; }
+  .log li { overflow-wrap: anywhere; }
+
+  .test { margin-top: auto; display: flex; gap: 18px; flex-wrap: wrap; }
+  .small-btn {
+    font: inherit; font-size: 13px; font-weight: 500; color: var(--ink); background: none; border: 0; padding: 4px 0; cursor: pointer;
+  }
+  .small-btn:hover { text-decoration: underline; text-underline-offset: 3px; }
+  button:focus-visible { outline: 2px solid var(--ink); outline-offset: 3px; }
+
+  @media (max-width: 820px) {
+    html, body { height: auto; }
+    .app { grid-template-columns: 1fr; height: auto; }
+    .stage { aspect-ratio: 1; max-width: 100%; order: -1; }
+    .panel { padding-inline: max(16px, env(safe-area-inset-left, 0px)) max(16px, env(safe-area-inset-right, 0px)); }
+  }
+</style>
+
+<div class="app">
+  <aside class="panel">
+    <section>
+      <h3>Notification</h3>
+      <p class="me">You are <span id="myId">…</span></p>
+      <ul class="log" id="log"></ul>
+    </section>
+
+    <section class="test" aria-label="Test controls">
+      <button class="small-btn" id="fireBtn">Start a fire</button>
+      <button class="small-btn" id="waterBtn"><span aria-hidden="true">↓</span>water</button>
+    </section>
+  </aside>
+  <div class="stage" id="stage">
+    <canvas id="tree" aria-label="Rings of text about wildfires, turning slowly. Burning words turn into the word fire."></canvas>
+  </div>
+
+</div>
+
+<script>
+(() => {
+  const TAU = Math.PI * 2;
+  const FONT = '"Lexend", "Avenir Next", "Helvetica Neue", sans-serif';
+  const reduced = matchMedia('(prefers-reduced-motion: reduce)').matches;
+  const $ = id => document.getElementById(id);
+
+  // Oldest record at the pith, newest on the bark. Approximate public figures, for visual testing.
+  const RECORDS = [
+    'Portugal 2017 — about 540,000 hectares burned and 117 lives lost.',
+    'California 2018 — the Camp Fire destroyed the town of Paradise, 85 dead.',
+    'Australia 2019–20 — the Black Summer burned about 24 million hectares.',
+    'Australia 2019–20 — nearly 3 billion animals killed or displaced.',
+    'United States 2020 — 10.1 million acres burned.',
+    'Russia, Yakutia 2021 — about 8 million hectares of taiga burned.',
+    'Greece, Evia 2021 — about 50,000 hectares of forest burned.',
+    'Spain 2022 — about 300,000 hectares burned.',
+    'Canada 2023 — about 18 million hectares burned in more than 6,000 fires.',
+    'Canada 2023 — more than 230,000 people evacuated from their homes.',
+    'Hawaii 2023 — Lahaina burned, 102 dead and thousands left homeless.',
+    'Greece, Evros 2023 — about 94,000 hectares, the largest fire on EU record.',
+    'Chile, Valparaíso 2024 — more than 130 people dead.',
+    'Bolivia 2024 — about 10 million hectares burned.',
+    'Brazil 2024 — about 30 million hectares of forest and savanna burned.',
+    'Portugal 2024 — about 135,000 hectares burned in one week.',
+    'Los Angeles 2025 — the Eaton and Palisades fires destroyed more than 16,000 homes and buildings.',
+    'Today — about 85% of wildfires in the United States are started by people.',
+  ];
+
+  const stage = $('stage');
+  const cv = $('tree');
+  const ctx = cv.getContext('2d');
+
+  // ---- paper grain --------------------------------------------------------
+  (function grain() {
+    const g = document.createElement('canvas'); g.width = g.height = 220;
+    const gx = g.getContext('2d'); const img = gx.createImageData(220, 220);
+    for (let i = 0; i < img.data.length; i += 4) {
+      img.data[i] = img.data[i + 1] = img.data[i + 2] = 30;
+      img.data[i + 3] = Math.random() * 14;
+    }
+    gx.putImageData(img, 0, 0);
+    gx.strokeStyle = 'rgba(0,0,0,0.035)';
+    for (let i = 0; i < 14; i++) {
+      gx.beginPath(); const x = Math.random() * 220, y = Math.random() * 220;
+      gx.moveTo(x, y); gx.quadraticCurveTo(x + Math.random() * 30 - 15, y + Math.random() * 30 - 15, x + Math.random() * 40 - 20, y + Math.random() * 40 - 20);
+      gx.stroke();
+    }
+    document.body.style.backgroundImage = `url(${g.toDataURL()})`;
+  })();
+
+  function rng(seed) { return () => { seed = (seed * 16807) % 2147483647; return (seed - 1) / 2147483646; }; }
+  const shapeSeed = rng(7);
+  const harmonics = Array.from({ length: 4 }, (_, k) => ({ k: k + 2, a: [0.045, 0.028, 0.015, 0.008][k], p: shapeSeed() * TAU }));
+  function shape(th, i) {
+    let m = 1;
+    for (const h of harmonics) m += h.a * Math.sin(h.k * th + h.p + i * 0.04);
+    return m;
+  }
+
+  let W = 0, H = 0, dpr = 1, cx = 0, cy = 0, maxR = 0, fontPx = 10, bigPx = 19;
+  let rings = [], ignitions = [], particles = [];
+  let rateMul = 1, waterTimer = 0, regrow = -1, t = 0;
+
+  // ---- glyph widths ------------------------------------------------------
+  const widthCache = new Map();
+  function charW(ch, size, wt = 400) {
+    const key = wt + '/' + size + ch;
+    let w = widthCache.get(key);
+    if (w === undefined) { ctx.font = `${wt} ${size}px ${FONT}`; w = ctx.measureText(ch).width; widthCache.set(key, w); }
+    return w;
+  }
+
+  // ---- the fire morph: homeless -> hofeless -> hofiless -> hofireless -> fire ----
+  const FIRE_STEPS = 4;
+  function wordText(w) {
+    if (w.stage === 0) return w.text;
+    if (w.stage > FIRE_STEPS) return 'fire';
+    const s = w.text, n = s.length, k = w.stage;
+    const p = Math.min(Math.max(1, Math.floor(n / 4)), Math.max(0, n - 1));
+    return s.slice(0, p) + 'fire'.slice(0, k) + s.slice(Math.min(n, p + Math.min(k, 2)));
+  }
+
+  // ---- rings: a few seed rings, then one more for every visitor ---------
+  const SEED_RINGS = 6;
+  let visitors = ['local'];  // visitor ids in join order; replaced by the shared list when online
+  let myId = 'local';
+
+  function makeRing(i, born) {
+    const rand = rng(1000 + i * 7);
+    const rec = RECORDS[i % RECORDS.length].split(' ');
+    return { i, R: 0, rec, k: Math.floor(rand() * rec.length), len: 0, words: [], glyphs: [], dirty: true,
+      rot: rand() * TAU, speed: (0.03 - i * 0.0007) * (reduced ? 0 : 1), born, mine: false };
+  }
+  // enough repeats to wrap the ring, plus spare words that slide in as burning words grow
+  function fillWords(r) {
+    while (r.len < TAU * r.R * 1.6) {
+      const text = r.rec[r.k++ % r.rec.length];
+      r.words.push({ text, stage: 0, timer: 0, lx: 0, ly: 0, visible: false });
+      r.len += (text.length + 1) * fontPx * 0.55;
+    }
+  }
+  function syncRings(born = t) {
+    if (!W) return;
+    const want = SEED_RINGS + visitors.length;
+    const r0 = fontPx * 3.2;
+    const gap = Math.max(fontPx * 1.7, Math.min(fontPx * 2.35, (maxR - r0) / Math.max(1, want - 1)));
+    const n = Math.min(want, Math.floor((maxR - r0) / gap) + 1); // a full stage stops growing outward
+    for (let i = rings.length; i < n; i++) rings.push(makeRing(i, born));
+    rings.length = n;
+    for (const r of rings) {
+      r.R = r0 + r.i * gap;
+      r.mine = visitors[r.i - SEED_RINGS] === myId;
+      fillWords(r);
+      r.dirty = true;
+    }
+  }
+
+  function build() {
+    const rect = stage.getBoundingClientRect();
+    dpr = Math.min(devicePixelRatio || 1, 2);
+    W = rect.width; H = rect.height;
+    cv.width = Math.round(W * dpr); cv.height = Math.round(H * dpr);
+    cx = W * 0.5; cy = H * 0.5;
+    maxR = Math.min(W, H) * 0.47;
+    fontPx = maxR > 320 ? 10.5 : 8.5;
+    bigPx = Math.round(fontPx * 1.9);
+    widthCache.clear();
+    rings = [];
+    syncRings(-10);
+  }
+
+  function layout(ring) {
+    const glyphs = [];
+    const end = TAU * 0.965; // rings stay slightly open, like the mockup
+    const wt = ring.mine ? 600 : 400;
+    let th = 0;
+    for (const w of ring.words) {
+      w.visible = false;
+      if (th >= end) continue;
+      const size = w.stage > FIRE_STEPS ? bigPx : fontPx;
+      const txt = wordText(w);
+      const startTh = th;
+      let fits = true;
+      const placed = [];
+      for (const ch of txt) {
+        const r = ring.R * shape(th, ring.i);
+        const d = charW(ch, size, wt) / r;
+        if (th + d > end) { fits = false; break; }
+        const mid = th + d / 2;
+        const rm = ring.R * shape(mid, ring.i);
+        placed.push({ ch, size, wt, lx: Math.cos(mid) * rm, ly: Math.sin(mid) * rm, la: mid + Math.PI / 2 });
+        th += d;
+      }
+      if (!fits) { th = end; continue; }
+      glyphs.push(...placed);
+      const midW = (startTh + th) / 2, rmW = ring.R * shape(midW, ring.i);
+      w.lx = Math.cos(midW) * rmW; w.ly = Math.sin(midW) * rmW; w.visible = true;
+      th += charW(' ', fontPx) * 1.1 / ring.R;
+    }
+    ring.glyphs = glyphs;
+    ring.dirty = false;
+  }
+
+  // ---- notifications ------------------------------------------------------
+  const handle = id => 'User' + (100000 + Math.abs([...id].reduce((h, c) => (h * 31 + c.charCodeAt(0)) | 0, 7)) % 900000);
+  let me = 'User' + Math.floor(100000 + Math.random() * 900000);
+  function addLog(msg) {
+    const li = document.createElement('li');
+    li.textContent = msg;
+    const log = $('log'); log.prepend(li);
+    while (log.children.length > 8) log.lastChild.remove();
+  }
+  const clean = s => s.replace(/[.,—]/g, '');
+  let lastBurnLog = 0;
+
+  // ---- fire ----------------------------------------------------------------
+  function ignite(x, y, r0 = 0) { ignitions.push({ x, y, r: r0 }); }
+  function randomEdgePoint() { const a = Math.random() * TAU; const r = maxR * (0.5 + Math.random() * 0.45); return [cx + Math.cos(a) * r, cy + Math.sin(a) * r]; }
+
+  function health() {
+    let all = 0, alive = 0;
+    for (const r of rings) for (const w of r.words) if (w.visible) { all++; if (w.stage === 0) alive++; }
+    return all ? alive / all : 1;
+  }
+  function burnRate() { return rateMul * (1 - Math.min(0.95, blow * 1.6)); }
+
+  // saving puts burning words back to their original text
+  function saveBurning(chance) {
+    let saved = null;
+    for (const r of rings) for (const w of r.words) {
+      if (w.stage > 0 && w.stage <= FIRE_STEPS && Math.random() < chance) { w.stage = 0; w.timer = 0; r.dirty = true; saved = saved || w.text; }
+    }
+    return saved;
+  }
+
+  function water(user, remote) {
+    const who = user || me;
+    if (!remote) post('water');
+    if (health() < 0.03) {
+      regrow = 0; ignitions = [];
+      addLog(`${who} just added water · the forest grows back`);
+      return;
+    }
+    rateMul = 0.08; waterTimer = 6;
+    ignitions.forEach(ig => ig.r *= 0.8);
+    const saved = saveBurning(0.75);
+    addLog(`${who} just added water`);
+    if (saved) addLog(`${who} saved the word «${clean(saved)}»`);
+  }
+
+  function startFire(user, remote) {
+    if (health() < 0.03 || regrow >= 0) return;
+    const [x, y] = randomEdgePoint(); ignite(x, y, maxR * 0.15);
+    addLog(`${user || me} started a fire`);
+    if (!remote) post('fire');
+  }
+
+  function smoke(x, y) { return { x, y, vx: (Math.random() - 0.5) * 8, vy: -10 - Math.random() * 14, life: 1, decay: 0.25 + Math.random() * 0.2 }; }
+
+  let blow = 0, blowing = false;
+
+  // ---- loop --------------------------------------------------------------
+  let last = performance.now();
+  function frame(now) {
+    const dt = Math.min(0.05, (now - last) / 1000); last = now; t += dt;
+    if (waterTimer > 0) { waterTimer -= dt; if (waterTimer <= 0) rateMul = 1; }
+    else rateMul += (1 - rateMul) * dt;
+
+    const rate = burnRate();
+    if (!blowing) for (const ig of ignitions) ig.r += dt * 30 * rate;
+
+    // regrowth: rings return from the pith outward
+    if (regrow >= 0) {
+      regrow += dt * 0.15;
+      const upto = regrow * rings.length;
+      for (const r of rings) if (r.i < upto) for (const w of r.words) if (w.stage !== 0) { w.stage = 0; r.dirty = true; }
+      if (regrow >= 1) { regrow = -1; addLog('A new ring has grown · memory can be added again'); }
+    }
+
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, W, H);
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.fillStyle = '#0b0b0b';
+    ctx.globalAlpha = 1;
+
+    for (const r of rings) {
+      r.rot += r.speed * dt;
+      const cs = Math.cos(r.rot), sn = Math.sin(r.rot);
+
+      // catch and advance fire, word by word
+      for (const w of r.words) {
+        if (!w.visible) continue;
+        if (w.stage === 0 && ignitions.length) {
+          const x = cx + w.lx * cs - w.ly * sn, y = cy + w.lx * sn + w.ly * cs;
+          for (const ig of ignitions) {
+            const dx = x - ig.x, dy = y - ig.y;
+            if (dx * dx + dy * dy < ig.r * ig.r && Math.random() < 0.05 * rate) {
+              w.stage = 1; w.timer = 0; r.dirty = true;
+              if (t - lastBurnLog > 2.5) { lastBurnLog = t; addLog(`The word «${clean(w.text)}» is burning`); }
+              break;
+            }
+          }
+        } else if (w.stage > 0 && w.stage <= FIRE_STEPS) {
+          w.timer += dt * Math.max(0.05, rate);
+          if (w.timer > 0.55) {
+            w.timer = 0; w.stage++; r.dirty = true;
+            const x = cx + w.lx * cs - w.ly * sn, y = cy + w.lx * sn + w.ly * cs;
+            for (let k = 0; k < 3; k++) particles.push(smoke(x + (Math.random() - 0.5) * 10, y));
+          }
+        }
+      }
+      if (r.dirty) layout(r);
+
+      // a new visitor's ring fades in
+      ctx.globalAlpha = Math.min(1, Math.max(0, (t - r.born) / 2.5));
+      let font = '';
+      for (const g of r.glyphs) {
+        const f = `${g.wt} ${g.size}px ${FONT}`;
+        if (f !== font) { font = f; ctx.font = f; }
+        const x = cx + g.lx * cs - g.ly * sn, y = cy + g.lx * sn + g.ly * cs;
+        const ang = g.la + r.rot;
+        const co = Math.cos(ang), si = Math.sin(ang);
+        ctx.setTransform(dpr * co, dpr * si, -dpr * si, dpr * co, x * dpr, y * dpr);
+        ctx.fillText(g.ch, 0, 0);
+      }
+    }
+
+    ctx.globalAlpha = 1;
+    // smoke: plain black dots that rise and drift with the breath
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.font = `400 ${fontPx}px ${FONT}`;
+    const wind = blow * 70;
+    for (let i = particles.length - 1; i >= 0; i--) {
+      const p = particles[i];
+      p.x += (p.vx + wind) * dt; p.y += p.vy * dt; p.life -= p.decay * dt;
+      if (p.life <= 0) { particles.splice(i, 1); continue; }
+      ctx.fillText('•', p.x, p.y);
+    }
+    if (particles.length > 500) particles.splice(0, particles.length - 500);
+
+    if (ignitions.length && ignitions.every(ig => ig.r > maxR * 2.6)) ignitions = [];
+    updateHud();
+    requestAnimationFrame(frame);
+  }
+
+  let hudTick = 0, wasBurned = false;
+  const showId = () => { $('myId').textContent = me; };
+  function updateHud() {
+    if (++hudTick % 10) return;
+    const h = health();
+    const burned = h < 0.03;
+    if (burned && !wasBurned) addLog('All memory has been lost · add water to grow it back');
+    wasBurned = burned;
+  }
+
+  // ---- shared forest: visitors and actions reach everyone with the link ----
+  // On claude.ai it uses the artifact database; anywhere else it uses the Socket.IO server (server.js).
+  // Empty means the server that served this page. On GitHub Pages, put your server's address here,
+  // for example 'https://health-of-trees.onrender.com'.
+  const SOCKET_SERVER = '';
+  const TAB = Math.random().toString(36).slice(2);
+  const TYPES = ['water', 'fire', 'help'];
+  let net = null; // { send(type) } once connected
+
+  function post(type) { if (net) net.send(type); }
+
+  function applyRemote(ev) {
+    const who = typeof ev.by === 'string' ? handle(ev.by) : 'Someone';
+    if (ev.type === 'water') water(who, true);
+    else if (ev.type === 'fire') startFire(who, true);
+    else if (ev.type === 'help') addLog(`${who} asks for help · add water!`);
+  }
+  function describe(ev) {
+    const who = typeof ev.by === 'string' ? handle(ev.by) : 'Someone';
+    return ev.type === 'water' ? `${who} just added water` : ev.type === 'fire' ? `${who} started a fire` : `${who} asked the community for help`;
+  }
+
+  async function connectShared() {
+    if (!window.claude || !window.claude.use) return connectSocket();
+    const [d, user] = await Promise.all(['db', 'user'].map(n => window.claude.use(n).catch(() => null)));
+    const id = user ? await user.id() : null;
+    if (!d || !id) return;
+    const db = d; myId = id; me = handle(id); showId();
+    net = { send: type => db.collection('events').add({ type, by: myId, tab: TAB, at: Date.now() })
+      .catch(() => addLog('You can watch, but this link does not let you act for everyone')) };
+
+    let first = true;
+    db.collection('visitors').orderBy('first').onSnapshot(snap => {
+      visitors = snap.docs.map(doc => doc.id);
+      if (!first) for (const c of snap.docChanges()) if (c.type === 'added') addLog(`${c.doc.id === myId ? me : handle(c.doc.id)} joined · a new ring grows`);
+      syncRings(first ? -10 : t);
+      first = false;
+    }, () => {});
+
+    const mine = db.doc('visitors/' + myId);
+    mine.get().then(s => s.exists ? (addLog(`${me} came back`), mine.update({ last: Date.now() })) : mine.set({ first: Date.now(), last: Date.now() }))
+      .catch(() => {});
+
+    let firstEv = true;
+    db.collection('events').orderBy('at', 'desc').limit(8).onSnapshot(snap => {
+      if (firstEv) { [...snap.docs].reverse().forEach(doc => { const ev = doc.data(); if (TYPES.includes(ev.type)) addLog(describe(ev)); }); firstEv = false; return; }
+      for (const c of snap.docChanges()) {
+        const ev = c.doc.data();
+        if (c.type === 'added' && ev && ev.tab !== TAB && TYPES.includes(ev.type)) applyRemote(ev);
+      }
+    }, () => {});
+
+    // keep the shared log small
+    db.collection('events').orderBy('at').get().then(snap => {
+      snap.docs.slice(0, Math.max(0, snap.size - 60)).forEach(doc => db.doc('events/' + doc.id).delete().catch(() => {}));
+    }).catch(() => {});
+  }
+
+  // ---- Socket.IO: live forest on GitHub Pages or any host --------------------
+  function connectSocket() {
+    if (location.protocol === 'file:' && !SOCKET_SERVER) return;
+    const base = (SOCKET_SERVER || location.origin).replace(/\/$/, '');
+    const s = document.createElement('script');
+    s.src = base + '/socket.io/socket.io.js'; // served by the Socket.IO server itself, so versions always match
+    s.onload = () => startSocket(base);
+    s.onerror = () => {}; // no server reachable: stay a single-visitor forest
+    document.head.append(s);
+  }
+
+  function startSocket(base) {
+    // the same browser keeps the same ID, so coming back doesn't add a second ring
+    let id = null;
+    try { id = localStorage.getItem('health-of-trees-id'); } catch {}
+    if (!id || !/^[a-z0-9]{6,32}$/.test(id)) {
+      id = Math.random().toString(36).slice(2, 10) + Math.random().toString(36).slice(2, 8);
+      try { localStorage.setItem('health-of-trees-id', id); } catch {}
+    }
+    myId = id; me = handle(id); showId();
+
+    const sock = io(base);
+    net = { send: type => sock.emit('action', type) };
+    const ids = list => Array.isArray(list) ? list.filter(v => typeof v === 'string') : visitors;
+    let first = true;
+    sock.on('connect', () => sock.emit('hello', id));
+    sock.on('init', d => {
+      visitors = ids(d.visitors); syncRings(first ? -10 : t);
+      if (!first) return;
+      first = false;
+      for (const ev of Array.isArray(d.events) ? d.events : []) if (ev && TYPES.includes(ev.type)) addLog(describe(ev));
+      addLog(d.isNew ? `${me} joined · a new ring grows` : `${me} came back`);
+    });
+    sock.on('visitors', list => { visitors = ids(list); syncRings(); });
+    sock.on('joined', vid => { if (typeof vid === 'string') addLog(`${handle(vid)} joined · a new ring grows`); });
+    sock.on('action', ev => { if (ev && TYPES.includes(ev.type)) applyRemote(ev); });
+  }
+
+  // ---- wiring ------------------------------------------------------------
+  $('waterBtn').addEventListener('click', () => water());
+  $('fireBtn').addEventListener('click', () => startFire());
+
+  let resizeT;
+  new ResizeObserver(() => { clearTimeout(resizeT); resizeT = setTimeout(build, 120); }).observe(stage);
+
+  const go = () => {
+    build();
+    showId();
+    connectShared().catch(() => {});
+    requestAnimationFrame(t0 => { last = t0; requestAnimationFrame(frame); });
+  };
+  (document.fonts ? Promise.all([document.fonts.load('400 10px "Lexend"'), document.fonts.load('500 10px "Lexend"')]).catch(() => {}) : Promise.resolve()).then(go, go);
+})();
+</script>

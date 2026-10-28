@@ -1,0 +1,16 @@
+{
+  "name": "health-of-trees",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Live server for Health of Trees: every visitor adds a ring, water and fire reach everyone.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "socket.io": "^4.7.5"
+  }
+}
